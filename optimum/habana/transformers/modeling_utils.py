@@ -29,7 +29,10 @@ from .models import (
     GaudiGPTJAttention,
     GaudiGPTJForCausalLM,
     GaudiGPTNeoXForCausalLM,
+    GaudiLlamaAttention,
+    GaudiLlamaDecoderLayer,
     GaudiLlamaForCausalLM,
+    GaudiLlamaModel,
     GaudiMptForCausalLM,
     GaudiMptModel,
     GaudiOPTForCausalLM,
@@ -73,9 +76,6 @@ from .models import (
     gaudi_gptj_block_forward,
     gaudi_gptj_model_forward,
     gaudi_invert_attention_mask,
-    gaudi_llama_attention_forward,
-    gaudi_llama_decoder_layer_forward,
-    gaudi_llama_model_forward,
     gaudi_llama_rmsnorm_forward,
     gaudi_mpt_attention_forward,
     gaudi_mpt_block_forward,
@@ -114,6 +114,7 @@ def adapt_transformers_to_gaudi():
     transformers.generation.GenerationMixin._update_model_kwargs_for_generation = (
         GaudiGenerationMixin._update_model_kwargs_for_generation
     )
+    transformers.generation.GenerationMixin._get_hpu_graphs_kwargs = GaudiGenerationMixin._get_hpu_graphs_kwargs
     transformers.generation.GenerationMixin._expand_inputs_for_generation = staticmethod(
         GaudiGenerationMixin._expand_inputs_for_generation
     )
@@ -226,9 +227,10 @@ def adapt_transformers_to_gaudi():
 
     # Optimization for llama generation on Gaudi
     transformers.models.llama.modeling_llama.LlamaForCausalLM = GaudiLlamaForCausalLM
-    transformers.models.llama.modeling_llama.LlamaModel.forward = gaudi_llama_model_forward
-    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = gaudi_llama_decoder_layer_forward
-    transformers.models.llama.modeling_llama.LlamaAttention.forward = gaudi_llama_attention_forward
+    transformers.models.llama.modeling_llama.LlamaModel = GaudiLlamaModel
+    transformers.models.llama.modeling_llama.LlamaAttention = GaudiLlamaAttention
+    transformers.models.llama.modeling_llama.LlamaDecoderLayer = GaudiLlamaDecoderLayer
+
     transformers.models.llama.modeling_llama.LlamaRMSNorm.forward = gaudi_llama_rmsnorm_forward
 
     # Optimization for falcon generation on Gaudi

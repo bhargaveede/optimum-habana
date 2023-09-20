@@ -91,6 +91,15 @@ class CausalLMBatch(Batch):
         max_truncation = 0
         padding_right_offset = 0
         max_decode_tokens = 0
+
+        # TODO: this should be set to rust side `max_total_tokens`,
+        # (see https://github.com/huggingface/text-generation-inference/blob/main/launcher/src/main.rs#L177)
+        # but TGI does not offer an API to expose this variable to python, as this variable
+        # is handled by the client but it appears the model is initialized by the server.
+        # An alternative could be to initialize the buffers during warmup.
+        # Dummy
+        max_total_tokens = 2048
+
         for i, r in enumerate(pb.requests):
             requests_idx_mapping[r.id] = i
             inputs.append(r.inputs)
@@ -118,6 +127,9 @@ class CausalLMBatch(Batch):
 
         max_input_length = max(input_lengths)
         max_tokens = len(inputs) * max_input_length + max_decode_tokens
+        if is_optimized_for_gaudi:
+            # pad to max_total_tokens in case max_new_token changes per request and triggers new hpu graph generation
+            padding_right_offset = max_total_tokens - max_input_length
 
         input_ids = tokenized_inputs["input_ids"]
         attention_mask = tokenized_inputs["attention_mask"]
@@ -221,16 +233,17 @@ class CausalLMBatch(Batch):
         past_kv_length = max_input_length - 1
         for layer in self.past_key_values:
             past_keys, past_values = layer
+            past_keys_dims = len(past_keys.shape)
+            if past_keys_dims == 3:
+                # Force past to be of dim [self_size, num_heads, ...] for easy indexing
+                past_keys = past_keys.view(len(self), -1, *past_keys.shape[-2:])
+                past_values = past_values.view(len(self), -1, *past_values.shape[-2:])
             if is_optimized_for_gaudi:
                 layer[0] = past_keys[keep_indices]
                 del past_keys
                 layer[1] = past_values[keep_indices]
                 del past_values
             else:
-                if len(past_keys.shape) == 3:
-                    # Force past to be of dim [self_size, num_heads, ...] for easy indexing
-                    past_keys = past_keys.view(len(self), -1, *past_keys.shape[-2:])
-                    past_values = past_values.view(len(self), -1, *past_values.shape[-2:])
                 if self.keys_head_dim_last:
                     layer[0] = past_keys[keep_indices, :, -past_kv_length:, :]
                 else:
@@ -238,6 +251,9 @@ class CausalLMBatch(Batch):
                 del past_keys
                 layer[1] = past_values[keep_indices, :, -past_kv_length:, :]
                 del past_values
+            if past_keys_dims == 3:
+                layer[0] = layer[0].view(layer[0].shape[0] * layer[0].shape[1], *layer[0].shape[-2:])
+                layer[1] = layer[1].view(layer[1].shape[0] * layer[1].shape[1], *layer[1].shape[-2:])
 
         top_n_tokens_tensor = self.top_n_tokens_tensor[keep_indices]
         max_tokens = len(request_ids) * max_input_length + total_remaining_decode_tokens
@@ -270,10 +286,15 @@ class CausalLMBatch(Batch):
         total_batch_size = 0
         max_input_length = 0
         padding_right_offset = 0
+        max_total_tokens = 0
         for batch in batches:
             total_batch_size += len(batch)
             max_input_length = max(max_input_length, batch.max_input_length)
             padding_right_offset = max(padding_right_offset, batch.padding_right_offset)
+            max_total_tokens = max(max_total_tokens, batch.max_input_length + batch.padding_right_offset)
+
+        if is_optimized_for_gaudi:
+            padding_right_offset = max_total_tokens - max_input_length
 
         # Batch attributes
         requests = []
@@ -361,12 +382,13 @@ class CausalLMBatch(Batch):
             # BLOOM Values: [batch_size * num_heads, seq_length, head_dim]
             # And ensure that we can update tensors in-place
             kv_tuple = False
+            past_key_values_dims = len(batch.past_key_values[0][0].shape)
             if type(batch.past_key_values[0]) == tuple:
                 batch.past_key_values = [
                     [t.view(len(batch), -1, *t.shape[-2:]) for t in layer] for layer in batch.past_key_values
                 ]
                 kv_tuple = True
-            elif len(batch.past_key_values[0][0].shape) == 3:
+            elif past_key_values_dims == 3:
                 for layer in batch.past_key_values:
                     for k, t in enumerate(layer):
                         layer[k] = t.view(len(batch), -1, *t.shape[-2:])
@@ -452,6 +474,15 @@ class CausalLMBatch(Batch):
 
                 # Update values
                 start_index = end_index
+
+            if past_key_values_dims == 3:
+                padded_past_keys = padded_past_keys.view(
+                    padded_past_keys.shape[0] * padded_past_keys.shape[1], *padded_past_keys.shape[-2:]
+                )
+                padded_past_values = padded_past_values.view(
+                    padded_past_values.shape[0] * padded_past_values.shape[1], *padded_past_values.shape[-2:]
+                )
+
             if kv_tuple:
                 past_key_values.append((padded_past_keys, padded_past_values))
             else:
@@ -622,7 +653,12 @@ class CausalLM(Model):
             top_token_logprobs,
         ) in enumerate(iterator):
             # Select next token
-            next_token_id, logprobs = next_token_chooser(all_input_ids.view(1, -1), logits[-1:, :])
+            if self.is_optimized_for_gaudi and logits.shape[-2] > 1:
+                next_token_id, logprobs = next_token_chooser(
+                    all_input_ids[0:input_length].view(1, -1), logits[input_length - 1 : input_length, :]
+                )
+            else:
+                next_token_id, logprobs = next_token_chooser(all_input_ids[0:input_length].view(1, -1), logits[-1:, :])
 
             # Append next token to all tokens
             if self.is_optimized_for_gaudi:
@@ -635,7 +671,7 @@ class CausalLM(Model):
             next_token_logprob = logprobs[-1, next_token_id]
             next_token_id_squeezed = next_token_id.squeeze()
             next_token_text, prefix_offset, read_offset = self.decode_token(
-                all_input_ids[:, 0], prefix_offset, read_offset
+                all_input_ids[0:new_input_length, 0], prefix_offset, read_offset
             )
 
             # Evaluate stopping criteria
@@ -652,7 +688,9 @@ class CausalLM(Model):
             if i % self.world_size == self.rank:
                 if stop:
                     # Decode generated tokens
-                    output_text = self.decode(all_input_ids[-stopping_criteria.current_tokens :, 0])
+                    output_text = self.decode(
+                        all_input_ids[new_input_length - stopping_criteria.current_tokens : new_input_length, 0]
+                    )
                     # Get seed
                     if isinstance(next_token_chooser.choice, Sampling):
                         seed = next_token_chooser.choice.seed
@@ -667,9 +705,9 @@ class CausalLM(Model):
                 if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
                     # Remove generated token to only have prefill and add nan for first prompt token
                     prefill_logprobs = [float("nan")] + torch.log_softmax(logits, -1).gather(
-                        1, all_input_ids[1:]
+                        1, all_input_ids[1:new_input_length]
                     ).squeeze(1)[-new_input_length:-1].tolist()
-                    prefill_token_ids = all_input_ids[-new_input_length:-1]
+                    prefill_token_ids = all_input_ids[0 : new_input_length - 1]
                     prefill_texts = self.tokenizer.batch_decode(
                         prefill_token_ids,
                         clean_up_tokenization_spaces=False,

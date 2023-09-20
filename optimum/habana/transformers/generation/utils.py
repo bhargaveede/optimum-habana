@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 import torch
 import torch.distributed as dist
-from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from transformers.generation.logits_process import LogitsProcessorList
@@ -48,11 +47,13 @@ from transformers.generation.utils import (
     SampleEncoderDecoderOutput,
     SampleOutput,
 )
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import ModelOutput
 
 from optimum.utils import logging
 
 from ...utils import HabanaProfile
+from ..integrations.deepspeed import unwrap_deepspeed_model
 from .configuration_utils import GaudiGenerationConfig
 
 
@@ -134,6 +135,15 @@ class GaudiGenerationMixin(GenerationMixin):
 
         return input_ids, model_kwargs
 
+    def _get_hpu_graphs_kwargs(self, model_kwargs):
+        hpu_graphs_kwargs = {}
+        if model_kwargs["limit_hpu_graphs"]:
+            hpu_graphs_kwargs.update({"bypass_hpu_graphs": False})
+            if "first_token" not in model_kwargs.keys():
+                model_kwargs["first_token"] = True
+                hpu_graphs_kwargs.update({"bypass_hpu_graphs": True})
+        return hpu_graphs_kwargs
+
     def _update_model_kwargs_for_generation(
         self,
         outputs: ModelOutput,
@@ -146,6 +156,8 @@ class GaudiGenerationMixin(GenerationMixin):
 
         Adds support for `token_idx`, which is necessary for using static shapes.
         """
+        # mark to identify starting from second token
+        model_kwargs["first_token"] = False
         # update past_key_values
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
             outputs, standardize_cache_format=standardize_cache_format
@@ -425,7 +437,7 @@ class GaudiGenerationMixin(GenerationMixin):
         if generation_config.static_shapes is None:
             generation_config.static_shapes = self.config.model_type in MODELS_OPTIMIZED_WITH_STATIC_SHAPES
         if generation_config.ignore_eos is None:
-            generation_config.ignore_eos = lazy_mode
+            generation_config.ignore_eos = not lazy_mode if self.config.is_encoder_decoder else lazy_mode
         generation_config.validate()
         model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
         self._validate_model_kwargs(model_kwargs.copy())
@@ -549,6 +561,22 @@ class GaudiGenerationMixin(GenerationMixin):
                 )
             generation_config.max_length = generation_config.max_new_tokens + input_ids_length
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+        # determine whether introduce trim_logits feature
+        model_kwargs["trim_logits"] = generation_config.trim_logits
+        # determine whether attention softmax needs to execute in lower precision
+        model_kwargs["attn_softmax_bf16"] = generation_config.attn_softmax_bf16
+        # determine whether limit_hpu_graphs needs to be used
+        model_kwargs["limit_hpu_graphs"] = generation_config.limit_hpu_graphs
+
+        # prepare for allocate kv cache
+        model_kwargs["reuse_cache"] = generation_config.reuse_cache
+        if not self.config.is_encoder_decoder:
+            calculated_max_length = input_ids.shape[-1]
+            if not generation_config.static_shapes and generation_config.max_new_tokens is not None:
+                calculated_max_length = input_ids.shape[-1] + generation_config.max_new_tokens
+            if generation_config.use_cache and generation_config.reuse_cache:
+                bs, _ = input_ids.shape
+                unwrap_deepspeed_model(self).allocate_kv_cache(bs * generation_config.num_beams, calculated_max_length)
 
         # 7. determine generation mode
         generation_mode = self._get_generation_mode(generation_config, assistant_model)
@@ -1183,6 +1211,7 @@ class GaudiGenerationMixin(GenerationMixin):
         hb_profer = HabanaProfile(warmup=profiling_warmup_steps, active=profiling_steps)
         hb_profer.start()
         this_peer_finished = False  # used by synced_gpus only
+
         while True:
             if lazy_mode:
                 self.htcore_generation.mark_step()
@@ -1200,12 +1229,15 @@ class GaudiGenerationMixin(GenerationMixin):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            hpu_graphs_kwargs = self._get_hpu_graphs_kwargs(model_kwargs)
+
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                **hpu_graphs_kwargs,
             )
 
             if synced_gpus and this_peer_finished:
@@ -1519,12 +1551,15 @@ class GaudiGenerationMixin(GenerationMixin):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            hpu_graphs_kwargs = self._get_hpu_graphs_kwargs(model_kwargs)
+
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                **hpu_graphs_kwargs,
             )
 
             if synced_gpus and this_peer_finished:
@@ -1837,11 +1872,14 @@ class GaudiGenerationMixin(GenerationMixin):
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            hpu_graphs_kwargs = self._get_hpu_graphs_kwargs(model_kwargs)
+
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                **hpu_graphs_kwargs,
             )
 
             if synced_gpus and this_peer_finished:
@@ -1919,7 +1957,10 @@ class GaudiGenerationMixin(GenerationMixin):
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             if model_kwargs["past_key_values"] is not None:
-                model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+                if model_kwargs["reuse_cache"]:
+                    model_kwargs["past_key_values"] = unwrap_deepspeed_model(self).reorder_kv_cache(beam_idx)
+                else:
+                    model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
 
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
@@ -2481,11 +2522,14 @@ class GaudiGenerationMixin(GenerationMixin):
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            hpu_graphs_kwargs = self._get_hpu_graphs_kwargs(model_kwargs)
+
             outputs = self(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                **hpu_graphs_kwargs,
             )
 
             if synced_gpus and this_peer_finished:

@@ -20,6 +20,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask, _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
@@ -27,7 +28,6 @@ from transformers.modeling_outputs import (
     Seq2SeqModelOutput,
 )
 from transformers.models.bart.modeling_bart import (
-    _expand_mask,
     shift_tokens_right,
 )
 from transformers.utils import (
@@ -352,7 +352,7 @@ def gaudi_BartEncoder_forward(
     # expand attention_mask
     if attention_mask is not None:
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
+        attention_mask = _prepare_4d_attention_mask(attention_mask, inputs_embeds.dtype)
 
     encoder_states = () if output_hidden_states else None
     all_attentions = () if output_attentions else None
@@ -463,7 +463,7 @@ def gaudi_BartDecoder_forward(
     # expand encoder attention mask
     if encoder_hidden_states is not None and encoder_attention_mask is not None:
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+        encoder_attention_mask = _prepare_4d_attention_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
     # embed positions
     import habana_frameworks.torch.core as htcore

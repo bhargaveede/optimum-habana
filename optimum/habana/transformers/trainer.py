@@ -968,9 +968,14 @@ class GaudiTrainer(Trainer):
                 rng_to_sync = True
 
             step = -1
+            is_compile_set = False
             for step, inputs in enumerate(epoch_iterator):
-                if self.args.compile_from_sec_iteration and is_torch_version(">=", "2.6.0"):
+                if not is_compile_set and self.args.compile_from_sec_iteration and is_torch_version(">=", "2.6.0"):
                     torch.compiler.set_stance("force_eager" if total_batched_samples == 0 else "default")
+                    if total_batched_samples > 0:
+                        is_compile_set = True
+                        #Add Deepspeed Zero3 Check
+                        self.accelerator.deepspeed_engine_wrapped.engine.optimizer._get_param_coordinator(training=True)._invalidate_trace()
                 if (
                     args.throughput_warmup_steps > 0
                     and (args.throughput_warmup_steps * args.gradient_accumulation_steps)
